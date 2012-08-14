@@ -1,4 +1,4 @@
-# Copyright (c) 2011 University of Southern California / ISI
+# Copyright (c) 2012 NTT DOCOMO, INC.
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -14,7 +14,7 @@
 #    under the License.
 
 """
-Tests for baremetal tilera driver.
+Tests for baremetal pxe driver.
 """
 
 import mox
@@ -23,26 +23,34 @@ from nova import exception
 from nova import flags
 from nova import test
 
-from nova.virt.baremetal import tilera
+from nova.virt.baremetal import pxe
 
 FLAGS = flags.FLAGS
 
 
-class BaremetalTILERATestCase(test.TestCase):
+class BaremetalPXETestCase(test.TestCase):
 
     def setUp(self):
-        super(BaremetalTILERATestCase, self).setUp()
+        super(BaremetalPXETestCase, self).setUp()
 
     def tearDown(self):
-        super(BaremetalTILERATestCase, self).tearDown()
+        super(BaremetalPXETestCase, self).tearDown()
 
     def test_init(self):
         self.flags(
-                tile_monitor="x",
+                baremetal_deploy_kernel="x",
+                baremetal_deploy_ramdisk="y",
                 )
-        tilera.TILERA()
+        pxe.PXE()
 
         self.flags(
-                tile_monitor="",
+                baremetal_deploy_kernel=None,
+                baremetal_deploy_ramdisk="y",
                 )
-        self.assertRaises(exception.NovaException, tilera.TILERA)
+        self.assertRaises(exception.NovaException, pxe.PXE)
+
+        self.flags(
+                baremetal_deploy_kernel="x",
+                baremetal_deploy_ramdisk=None,
+                )
+        self.assertRaises(exception.NovaException, pxe.PXE)
