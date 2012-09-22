@@ -20,7 +20,7 @@
 """
 A driver for Bare-metal platform.
 """
-
+import os
 from nova.compute import power_state
 from nova import context as nova_context
 from nova import db
@@ -64,7 +64,7 @@ opts = [
                help='power management method'),
     cfg.StrOpt('baremetal_tftp_root',
                default='/tftpboot',
-               help='BareMetal compute node\'s tftp root path'),
+               help='BareMetal compute nodes tftp root path'),
     ]
 
 FLAGS = flags.FLAGS
@@ -197,32 +197,46 @@ class BareMetalDriver(driver.ComputeDriver):
         var = self.baremetal_nodes.define_vars(instance, network_info,
                                                block_device_info)
 
-        self._plug_vifs(instance, network_info, context=context)
+        # if we have bmpxeinstaller set as a image_meta properties then will 
+        # handle the image a bit differently
+        pxe_tftp_build = self.check_if_tftp_boot_image(image_meta)
+        if pxe_tftp_build:
+            LOG.debug("Setting up pxe tftp boot for dare metal")
 
-        self._firewall_driver.setup_basic_filtering(instance, network_info)
-        self._firewall_driver.prepare_instance_filter(instance, network_info)
-
-        self.baremetal_nodes.create_image(var, context, image_meta, node,
-                                          instance,
-                                          injected_files=injected_files,
-                                          admin_password=admin_password)
-        self.baremetal_nodes.activate_bootloader(var, context, node,
-                                                 instance)
+            self.baremetal_nodes.create_pxe_tftp_boot_image_files(var, node, 
+                context, instance, image_meta, admin_password, 
+                block_device_info=block_device_info)
+            self.baremetal_nodes.setup_node_dnsmasq(node, var, instance)
+        else:
+	        self._plug_vifs(instance, network_info, context=context)
+	
+	        self._firewall_driver.setup_basic_filtering(instance, network_info)
+	        self._firewall_driver.prepare_instance_filter(instance, network_info)
+	
+	        self.baremetal_nodes.create_image(var, context, image_meta, node,
+	                                          instance,
+	                                          injected_files=injected_files,
+	                                          admin_password=admin_password)
+	        self.baremetal_nodes.activate_bootloader(var, context, node,
+	                                                 instance)
 
         pm = get_power_manager(node)
-        state = pm.activate_node()
+        if pxe_tftp_build:
+            state = pm.activate_tftp_node()
+            _update_baremetal_state(context, node, instance, state)
+        else:
+            state = pm.activate_node()
+            _update_baremetal_state(context, node, instance, state)
 
-        _update_baremetal_state(context, node, instance, state)
-
-        self.baremetal_nodes.activate_node(var, context, node, instance)
-        self._firewall_driver.apply_instance_filter(instance, network_info)
-
-        block_device_mapping = driver.block_device_info_get_mapping(
-            block_device_info)
-        for vol in block_device_mapping:
-            connection_info = vol['connection_info']
-            mountpoint = vol['mount_device']
-            self.attach_volume(connection_info, instance['name'], mountpoint)
+            self.baremetal_nodes.activate_node(var, context, node, instance)
+            self._firewall_driver.apply_instance_filter(instance, network_info)
+    
+            block_device_mapping = driver.block_device_info_get_mapping(
+                block_device_info)
+            for vol in block_device_mapping:
+                connection_info = vol['connection_info']
+                mountpoint = vol['mount_device']
+                self.attach_volume(connection_info, instance['name'], mountpoint)
 
         if node['terminal_port']:
             pm.start_console(node['terminal_port'], node['id'])
@@ -248,8 +262,26 @@ class BareMetalDriver(driver.ComputeDriver):
 
         var = self.baremetal_nodes.define_vars(instance, network_info,
                                                block_device_info)
+        
+        # if this is a tftp booted node (need image_meta here)
+        if os.path.exists(os.path.join(var['image_root'], 'mnt')):
+            self.baremetal_nodes.remove_node_dnsmasq(node, var, instance)
+            self.baremetal_nodes.deactivate_tftp_node(var, ctx, node, instance)
+        else:
+            self.baremetal_nodes.deactivate_node(var, ctx, node, instance)
 
-        self.baremetal_nodes.deactivate_node(var, ctx, node, instance)
+            ## cleanup volumes
+            # NOTE(vish): we disconnect from volumes regardless
+            block_device_mapping = driver.block_device_info_get_mapping(
+                block_device_info)
+            for vol in block_device_mapping:
+                connection_info = vol['connection_info']
+                mountpoint = vol['mount_device']
+                self.detach_volume(connection_info, instance['name'], mountpoint)
+    
+            self.baremetal_nodes.deactivate_bootloader(var, ctx, node, instance)
+
+        self.baremetal_nodes.destroy_images(var, ctx, node, instance)
 
         pm = get_power_manager(node)
 
@@ -258,18 +290,6 @@ class BareMetalDriver(driver.ComputeDriver):
         ## power off the node
         state = pm.deactivate_node()
 
-        ## cleanup volumes
-        # NOTE(vish): we disconnect from volumes regardless
-        block_device_mapping = driver.block_device_info_get_mapping(
-            block_device_info)
-        for vol in block_device_mapping:
-            connection_info = vol['connection_info']
-            mountpoint = vol['mount_device']
-            self.detach_volume(connection_info, instance['name'], mountpoint)
-
-        self.baremetal_nodes.deactivate_bootloader(var, ctx, node, instance)
-
-        self.baremetal_nodes.destroy_images(var, ctx, node, instance)
 
         # stop firewall
         self._firewall_driver.unfilter_instance(instance,
@@ -475,3 +495,22 @@ class BareMetalDriver(driver.ComputeDriver):
     def get_console_output(self, instance):
         node = _get_baremetal_node_by_instance_uuid(instance['uuid'])
         return self.baremetal_nodes.get_console_output(node, instance)
+
+    def check_if_tftp_boot_image(self, image_meta):
+        """
+        check to see if a image is a tftp boot image
+        """
+        tftp_build = False
+        if 'properties' in image_meta:
+            if 'bmpxetftpinstaller' in image_meta['properties']:
+                if image_meta['properties']['bmpxetftpinstaller']:
+                    # this is a install image for tftp pxe booting bm nodes
+                    # so we are going to handle it differently
+                    LOG.debug("bmpxetftpinstaller set")
+                    tftp_build = True
+            else:
+                LOG.debug("bmpxetftpinstaller not in image_meta properties")
+        else:
+            LOG.debug("properties not in image_meta")
+        
+        return tftp_build

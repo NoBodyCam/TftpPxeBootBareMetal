@@ -108,10 +108,42 @@ class Ipmi(object):
         LOG.debug("err: %s", err)
         return out, err
 
+    def activate_tftp_node(self):
+        self._power_off()
+        self._set_boot_dev_for_next_boot()
+        state = self._power_on()
+        return state
+
     def activate_node(self):
         self._power_off()
         state = self._power_on()
         return state
+
+    def _set_boot_dev_for_next_boot(self):
+        """ 
+        set the next boot to use pxe 
+
+        cjk 2012.09.04
+        """
+        count = 0
+        # need better error handling         
+        exit_status=0
+        while exit_status==0:
+            count += 1
+            # cjk needs to be a settable value
+            if count > 5:
+                exit_status = 9
+            try:
+                self._exec_ipmitool("chassis bootdev pxe")
+            except Exception:
+                LOG.exception("Setting boot dev failed")
+                exit_status = 2
+            else:
+                # command didn't, at least, cause an error
+                exit_status = 1
+                return baremetal_states.ACTIVE
+            time.sleep(5)
+        return baremetal_states.ERROR
 
     def reboot_node(self):
         self._power_off()
@@ -228,7 +260,10 @@ class DummyIpmi(object):
 
     def activate_node(self):
         return baremetal_states.ACTIVE
-
+        
+    def activate_tftp_node(self):
+        return baremetal_states.ACTIVE
+        
     def reboot_node(self):
         return baremetal_states.ACTIVE
 
