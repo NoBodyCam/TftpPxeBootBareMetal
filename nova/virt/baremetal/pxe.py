@@ -21,7 +21,7 @@ Class for PXE bare-metal nodes.
 
 import os
 import shutil
-
+import signal
 from nova.compute import instance_types
 from nova import exception
 from nova import flags
@@ -71,7 +71,7 @@ pxe_opts = [
                 default='install_inc/txt.cfg',
                 help='file for pxe boot kernel options'),
     cfg.StrOpt('baremetal_pxe_tftp_base_url',
-                default='http://10.10.16.195/media/',
+                default=None,
                 help='base url for pxe tftp install'),
     cfg.StrOpt('baremetal_pxe_tftp_node_default_interface',
                 default='eth2',
@@ -84,24 +84,33 @@ pxe_opts = [
                 help='override passed to node to support environment testing'),
     cfg.StrOpt('baremetal_pxe_tftp_node_broadcast_override',
                 default='10.10.16.255',
-                help='over ride passed to node to support environment testing'),
+                help='override passed to node to support environment testing'),
     cfg.StrOpt('baremetal_pxe_tftp_node_dns_override',
                 default='208.67.222.222',
-                help='over ride passed to node to support environment testing'),
+                help='override passed to node to support environment testing'),
     cfg.StrOpt('baremetal_pxe_tftp_node_hwaddress_override',
                 default=None,
-                help='over ride passed to node to support environment testing'),
+                help='override passed to node to support environment testing'),
     cfg.StrOpt('baremetal_dnsmasq_dhcp_host_file',
                 default='/var/lib/nova/baremetal/dnsmasq/dnsmasq-dhcp.host',
-                help='baremetal dnsmasq dhcp lease location'),
+                help='baremetal dnsmasq dhcp lease reservation location'),
     cfg.StrOpt('baremetal_tftp_web_store_path',
-                default='/opt/stack/horizon/openstack_dash_board/static/',
+                default=None,
                 help='web storage path for tftp files'),
-            ]
+           ]
 
 FLAGS = flags.FLAGS
 FLAGS.register_opts(pxe_opts)
 
+
+# support for override values (for limited raq testing)
+override_check = {'interface': FLAGS.baremetal_pxe_tftp_node_default_interface,
+    'gateway': FLAGS.baremetal_pxe_tftp_node_gateway_override,
+    'netmask': FLAGS.baremetal_pxe_tftp_node_netmask_override,
+    'broadcast': FLAGS.baremetal_pxe_tftp_node_broadcast_override,
+    'dns': FLAGS.baremetal_pxe_tftp_node_dns_override
+    }
+    
 
 def get_baremetal_nodes():
     return PXE()
@@ -149,17 +158,21 @@ def _start_tftp_dnsmasq(interface, tftp_root, host_path, pid_path, lease_path):
     LOG.debug(_("lease_path: %s ") % lease_path)
 
     # this can be done better I'm sure 
-    proc_check_cmd = \
-        "ps ax -o pid,args | grep dnsmasq | grep enable-tftp | grep -v grep"
-    process_check = os.popen(proc_check_cmd).read()
-    if process_check:
+    if os.path.exists(pid_path):
         # dnsmasq running ... stop it
         LOG.debug("dnsmasq running stopping for restart")
         f = open(pid_path)
         pid_to_stop = f.readline()
         pid_to_stop = pid_to_stop.rstrip('\n')
-        utils.execute('sudo', 'kill', '-term', pid_to_stop)
         f.close()
+        try:
+            os.kill(int(pid_to_stop), signal.SIGTERM)
+        except OSError:
+            LOG.debug("Removing stale dnsmasq pid file.")
+            os.unlink(pid_path)       
+    else:
+        LOG.debug(_("dnsmasq not running"))
+        
     # we need to set --dhcp-range for each ip listed in host_path
     dhcp_range_options = ''
     tmp_dhcp_mac = ''
@@ -169,7 +182,8 @@ def _start_tftp_dnsmasq(interface, tftp_root, host_path, pid_path, lease_path):
     for line in f: 
         tmp_dhcp_mac, tmp_dhcp_name, tmp_dhcp_address = line.split(',')
         tmp_dhcp_address = tmp_dhcp_address.rstrip('\r\n')
-        dhcp_range_options += '--dhcp-range=%s,%s ' % (tmp_dhcp_address, tmp_dhcp_address)
+        dhcp_range_options += '--dhcp-range=%s,%s ' % (tmp_dhcp_address, 
+            tmp_dhcp_address)
     f.close()
     dhcp_range_options.rstrip()
 
@@ -188,6 +202,13 @@ def _start_tftp_dnsmasq(interface, tftp_root, host_path, pid_path, lease_path):
         '--dhcp-hostsfile=%s' % host_path )
 
     LOG.debug(_("Command result: %s") % str(tmp_cmd_result))
+    # now because we started with sudo. a quick fix
+    if os.path.exists(pid_path):
+        LOG.debug(_("Setting ownership on: %s") % str(pid_path))
+        utils.execute('sudo', 'chown', 'stack:stack', pid_path)
+    if os.path.exists(lease_path):
+        LOG.debug(_("Setting ownership on: %s") % str(lease_path))
+        utils.execute('sudo', 'chown', 'stack:stack', lease_path)
 
 def _unlink_without_raise(path):
     try:
@@ -478,10 +499,7 @@ class PXE(object):
     def destroy_images(self, var, context, node, instance):
         image_root = var['image_root']
         mount_check = os.path.join(image_root, 'mnt')
-        if os.path.exists(mount_check):
-            if os.path.ismount(mount_check):
-                utils.execute('sudo', 'umount', mount_check)
-
+        self.unmount_tftp_image(mount_check)
         shutil.rmtree(image_root, ignore_errors=True)
 
     def _pxe_cfg_name(self, node):
@@ -586,16 +604,10 @@ class PXE(object):
         # remove tftp files
         network_info = var['network_info']
         node_ip = self.get_value_from_net_info(network_info, 'ip')
-        tftp_node_dir = os.path.join(var['tftp_root'], node_ip)
-        LOG.debug(_("Removing : %s") % tftp_node_dir)
-        shutil.rmtree(tftp_node_dir, ignore_errors=True)
-        
-        web_files_locaton = FLAGS.baremetal_tftp_web_store_path
-        files_to_check = os.listdir(web_files_locaton)
-        for working_file in files_to_check:
-            if node_ip in working_file:
-                LOG.debug(_("Removing : %s") % working_file)
-                os.remove(os.path.join(web_files_locaton, working_file))
+        node_tftp_path = os.path.join(var['tftp_root'], node_ip)
+        node_image_mont_unpac_path = os.path.join(var['image_root'], 'mnt')
+        self.remove_tftp_boot_directories(node_tftp_path, 
+            node_image_mont_unpac_path, node_ip)
         
     def activate_node(self, var, context, node, instance):
         pass
@@ -631,14 +643,8 @@ class PXE(object):
         
         #build image the file name
         if image_meta['disk_format'] == "iso":
-            """
-            ISO Image : mount it, copy files, unmount it
-            """
             image_file_name = filename_ext(image_distro, "iso")
         elif image_meta['disk_format'] == "raw":
-            """
-            tar.gz Image: untar it, copy files 
-            """
             image_file_name = filename_ext(image_distro, "tar.gz")
         else:
             raise exception.NovaException(_("unsupported disk type"))
@@ -656,43 +662,24 @@ class PXE(object):
               user_id=instance['user_id'],
               project_id=instance['project_id'])
 
-        LOG.debug("fetched tftp boot image")
-
-
         LOG.info("Creating image pxe tftp templates")
 
-        if image_meta['disk_format'] == "iso":
-            LOG.debug(_("mounting %s to %s") % (image_file_full_path, 
-                image_mnt_unpac_path))
+        self.mount_unpac_tftp_image(image_file_full_path, image_mnt_unpac_path, 
+            image_meta['disk_format'])
 
-            utils.execute('sudo', 'mount', '-o', 'loop', image_file_full_path, 
-                image_mnt_unpac_path)
+        self.setup_tftp_boot_directories(instance, network_info, var, 
+            image_distro, node_host_name, node, admin_password)
 
-        elif image_meta['disk_format'] == "raw":
-            LOG.debug(_("untaring %s to %s") % (image_file_full_path, 
-                image_mnt_unpac_path))
-                
-            utils.execute('sudo', 'tar', '-xzvf', image_file_full_path, '-C', 
-                image_mnt_unpac_path)
+        self.unmount_tftp_image(image_mnt_unpac_path)
 
-        self.setup_tftp_boot_directories(instance, network_info, var, image_distro, 
-            node_host_name, node)
-
-        if image_meta['disk_format'] == "iso":
-            LOG.debug("unmounting master image")
-            utils.execute('sudo', 'umount', image_mnt_unpac_path)
-        elif image_meta['disk_format'] == "raw":
-            LOG.debug("tar master image unthing to unmount")
-
-
-    def setup_tftp_boot_directories(self, instance, network_info, var, image_distro, 
-        node_host_name, node):
+    def setup_tftp_boot_directories(self, instance, network_info, var,
+        image_distro, node_host_name, node, admin_password):
         """
         Setup the tftp boot directories and files
         Check to see if the directories / files we are about to create
         exist. if they do delete them
         """
-        LOG.debug(_("checking for per_host_tftp_boot_directories before setup."))
+        LOG.debug(_("checking for tftp boot directories before setup."))
         node_ip = self.get_value_from_net_info(network_info, 'ip')
         node_image_mont_unpac_path = os.path.join(var['image_root'], 'mnt')
         node_tftp_path = os.path.join(var['tftp_root'], node_ip)
@@ -706,8 +693,6 @@ class PXE(object):
 
         LOG.debug(_("setting up tftp boot (distro: %s / host name: %s )") % 
            (image_distro, node_host_name))
-
-        
         
         if not os.path.isdir(node_tftp_path):
             # root tftp directory not found. Create it
@@ -715,7 +700,8 @@ class PXE(object):
             os.makedirs(node_tftp_path)
     
         # copy the pxe boot files into place
-        master_boot_tree = os.path.join(node_image_mont_unpac_path, image_distro)
+        master_boot_tree = os.path.join(node_image_mont_unpac_path, 
+            image_distro)
         files_to_copy = os.listdir(master_boot_tree)
         for working_file in files_to_copy:
             src = os.path.join(master_boot_tree, working_file)
@@ -725,59 +711,51 @@ class PXE(object):
             else:
                 shutil.copy2(src,dst)
   
-        # create pxe kernel options file
-        kernel_options_file = os.path.join(node_tftp_path, 
-            FLAGS.baremetal_pxe_tftp_boot_kernel_options_file)
-        LOG.debug(_("configuring kernel options file (%s)") % kernel_options_file)
-        
-        template_file_text = open(kernel_options_file).read()
+        # setup pxe boot kernel options file for tftp
+        self.setup_tftp_boot_kernel_options_file(node_tftp_path, node_ip, 
+            node_host_name, image_distro)
 
-        tmp_interface = FLAGS.baremetal_pxe_tftp_node_default_interface
-        tmp_hostname = node_host_name
-        tmp_preseed_url = _(FLAGS.baremetal_pxe_tftp_base_url + image_distro + 
-            '.preseed.' + node_ip)
+        web_store_location = os.path.join(FLAGS.baremetal_tftp_web_store_path, 
+            node_ip)
 
-        template_values = {'interface': tmp_interface, 'hostname': tmp_hostname, 
-            'preseed_url': tmp_preseed_url}
-        
-        # not sure what going on here.. this should work
-        #_late_load_cheetah()
-        #template_filled_in = str(Template(template_file_text, 
-        #    searchList={'template_values': template_values}))
-
-        # because template system just not working
-        template_file_text = template_file_text.replace( 
-            '${template_values.interface}', tmp_interface)
-        template_file_text = template_file_text.replace( 
-            '${template_values.hostname}', tmp_hostname)
-        template_file_text = template_file_text.replace( 
-            '${template_values.preseed_url}', tmp_preseed_url)
-        template_filled_in = template_file_text
-
-        # save the kernel options file
-        f = open(kernel_options_file, 'w+')
-        f.write(template_filled_in)
-        f.close()
+        if not os.path.isdir(web_store_location):
+            # tftp conf directory not found. Create it
+            LOG.debug(_("Directory %s not found creating") % web_store_location)
+            os.makedirs(web_store_location)
 
         # now the preseed and other install files
         self.create_node_tftp_files(node_host_name, var, instance, 
-            image_distro, node)
+            image_distro, node, admin_password)
 
     def get_value_from_net_info(self, network_info, look_for=''):
         """
         get first value from network_info and return it
         """
-        return_value = ''
+        return_value = ''        
         if look_for:
-            LOG.debug(_("Looking for network value: %s") % look_for)
-            for tmp_net in network_info:
-                if not return_value and look_for == 'broadcast':
-                    return_value = tmp_net[1]['broadcast']
-                for tmp_ips in tmp_net[1]['ips']:
-                    if not return_value:
-                        return_value = tmp_ips[look_for]
+            if look_for == 'interface':
+                # default to eth 0 for most systems
+                return_value = 'eth0'
+            else:
+                LOG.debug(_("Looking for network value: %s") % look_for)
+                for tmp_net in network_info:
+                    if not return_value and look_for == 'broadcast':
+                        return_value = tmp_net[1]['broadcast']
+                    elif not return_value and look_for == 'dns':
+                        return_value = tmp_net[1]['dns']
+                    for tmp_ips in tmp_net[1]['ips']:
+                        if not return_value:
+                            return_value = tmp_ips[look_for]
         else:
             return_value = "nothing to look up."
+
+        
+        # support for override values (for limited raq testing)
+        if look_for in override_check:
+            if override_check[look_for]:
+                LOG.debug("using network override value")
+                return_value = override_check[look_for]
+        
         LOG.debug(_("Returning : %s") % return_value)
         return return_value
 
@@ -787,25 +765,20 @@ class PXE(object):
         check for the pxe boot directories and files needed to boot a node
         """
         anything_found = False
-        LOG.debug(_("checking for per node pxe files for at: %s") % node_tftp_path)
+        LOG.debug(_("checking pxe files for at: %s") % node_tftp_path)
         # first check for the tptp boot dir
         
         if os.path.exists(node_tftp_path):
             anything_found = True
             LOG.debug(_("Found: %s") % node_tftp_path)
 
-        # now the cfg files
-        master_template_path = os.path.join(node_image_mont_unpac_path, 'templates')
-        master_templates = os.listdir(master_template_path)
+        # now the pre / post cfg files
+        web_store_location = os.path.join(FLAGS.baremetal_tftp_web_store_path, 
+            node_ip)
 
-        for filename in master_templates:
-            file_to_check = self.get_pxe_file_name(filename, node_ip)
-            web_store_location = os.path.join( 
-                FLAGS.baremetal_tftp_web_store_path, file_to_check)
-
-            if os.path.exists(web_store_location):
-                anything_found = True
-                LOG.debug(_("Found: %s") % web_store_location)
+        if os.path.exists(web_store_location):
+            anything_found = True
+            LOG.debug(_("Found: %s") % web_store_location)
 
         return anything_found
 
@@ -821,7 +794,7 @@ class PXE(object):
         """
         remove the pxe boot directories and files needed to boot a node
         """
-        LOG.debug(_("removing per node pxe files for Ip: %s") % node_ip)
+        LOG.debug(_("removing pxe tftp boot files for Ip: %s") % node_ip)
         if os.path.isdir(node_tftp_path):
             shutil.rmtree(node_tftp_path)
             LOG.debug(_("removed %s") % node_tftp_path)
@@ -829,142 +802,129 @@ class PXE(object):
             LOG.debug(_("%s not found") % node_tftp_path)
             
         # now the cfg files
-        master_template_path = os.path.join(node_image_mont_unpac_path, 'templates')
-        if os.path.exists(master_template_path):
-            master_templates = os.listdir(master_template_path)
-
-            for filename in master_templates:
-                file_to_check = self.get_pxe_file_name(filename, node_ip)
-                web_store_location = os.path.join( 
-                FLAGS.baremetal_tftp_web_store_path, file_to_check)
-    
-                if os.path.exists(web_store_location):
-                    os.unlink(web_store_location)
-                    LOG.debug(_("Removed: %s") % web_store_location)
+        LOG.debug(_("removing pxe config files for Ip: %s") % node_ip)
+        # now the pre / post cfg files
+        web_store_location = os.path.join(FLAGS.baremetal_tftp_web_store_path, 
+            node_ip)
+        if os.path.isdir(web_store_location):
+            shutil.rmtree(web_store_location)
+            LOG.debug(_("removed %s") % web_store_location)
         else:
-            LOG.debug(_("%s not found") % master_template_path)
-            
+            LOG.debug(_("%s not found") % web_store_location)
+
     def create_node_tftp_files(self, node_hostname, var, instance, 
-        image_distro, node):
+        image_distro, node, admin_password):
         """
-        Creates a preseed file for baremetal node and 
+        Creates a preseed / kickstart file for baremetal node 
         places it a http accessible directory
         """
-        LOG.debug(_("Creating pre/post-install files for node : %s") % node_hostname)
+        LOG.debug(_("Creating pre/post-install files for node : %s") % 
+            node_hostname)
         # setup what we need to build our templates
-        master_template_path = os.path.join(var['image_root'], 'mnt', 'templates')
+        master_template_path = os.path.join(var['image_root'], 'mnt', 
+            'templates')
         master_templates = os.listdir(master_template_path)
         network_info = var['network_info']
         node_ip = self.get_value_from_net_info(network_info, look_for='ip')
+        node_web_store_path = os.path.join(FLAGS.baremetal_tftp_web_store_path, 
+            node_ip)
+
+        node_net_netmask = self.get_value_from_net_info(network_info, 
+            look_for='netmask')
+   
+        node_net_gateway = self.get_value_from_net_info(network_info, 
+            look_for='gateway')
+
+        node_net_broadcast = self.get_value_from_net_info(network_info, 
+            look_for='broadcast')
+
+        node_net_dns = self.get_value_from_net_info(network_info, 
+            look_for='dns')
+
+        node_net_name = self.get_value_from_net_info(network_info, 
+            look_for='interface')
+                
+        node_net_hwaddress = node['prov_mac_address']
+
+        tmp_root_key_url = _(self.get_node_tftp_conf_base_url(node_ip) +
+            image_distro + '.root_key.' + node_ip)
+        tmp_interface_url = _(self.get_node_tftp_conf_base_url(node_ip) 
+            + image_distro + '.interface.' + node_ip)
+
+        tmp_repo_url = FLAGS.baremetal_pxe_tftp_base_url
+
 
         for filename in master_templates:
             file_to_create = self.get_pxe_file_name(filename, node_ip)
-            web_store_location = os.path.join( 
-                FLAGS.baremetal_tftp_web_store_path, file_to_create)
+            web_store_location = os.path.join(node_web_store_path, 
+                file_to_create)
 
             template_file = os.path.join(master_template_path, filename)
 
             template_file_text = open(template_file).read()
 
+            template_values = {'root_key_url': tmp_root_key_url, 
+                'interface_file_url': tmp_interface_url,
+                'name': node_net_name, 
+                'address': node_ip, 
+                'netmask': node_net_netmask, 
+                'broadcast': node_net_broadcast, 
+                'gateway': node_net_gateway, 
+                'dns': node_net_dns, 
+                'hwaddress': node_net_hwaddress,
+                'root_key': instance['key_data']
+                }
+ 
             if 'preseed' in filename:
                 LOG.debug("Setup preseed file")
-                
-                tmp_root_key_url = _(FLAGS.baremetal_pxe_tftp_base_url +
-                    image_distro + '.root_key.' + node_ip)
-                tmp_interface_url = _(FLAGS.baremetal_pxe_tftp_base_url + 
-                    image_distro + '.interface.' + node_ip)
-
-                template_values = {'root_key_url': tmp_root_key_url, 
-                    'interface_file_url': tmp_interface_url}
-                
-                # because template system just not working
-                template_file_text = template_file_text.replace(
-                    '${template_values.root_key_url}', tmp_root_key_url)
-                template_file_text = template_file_text.replace(
-                    '${template_values.interface_file_url}', tmp_interface_url)
             elif 'interface' in filename:
                 LOG.debug("Setup interface vars")
-
-                # support for override values (for limited raq testing)
-                if FLAGS.baremetal_pxe_tftp_node_netmask_override:
-                    node_net_netmask = \
-                        FLAGS.baremetal_pxe_tftp_node_netmask_override
-                else:
-                    node_net_netmask = self.get_value_from_net_info( 
-                        network_info, look_for='netmask')
-
-                if FLAGS.baremetal_pxe_tftp_node_gateway_override:
-                    node_net_gateway = \
-                        FLAGS.baremetal_pxe_tftp_node_gateway_override
-                else:
-                    node_net_gateway = self.get_value_from_net_info( 
-                        network_info, look_for='gateway')
-
-                if FLAGS.baremetal_pxe_tftp_node_broadcast_override:
-                    node_net_broadcast = \
-                        FLAGS.baremetal_pxe_tftp_node_broadcast_override
-                else:
-                    node_net_broadcast = self.get_value_from_net_info( 
-                        network_info, look_for='broadcast')
-
-                if FLAGS.baremetal_pxe_tftp_node_dns_override:
-                    node_net_dns = FLAGS.baremetal_pxe_tftp_node_dns_override
-                else:
-                    node_net_dns = self.get_value_from_net_info( 
-                        network_info, look_for='dns')
-
-                if FLAGS.baremetal_pxe_tftp_node_hwaddress_override:
-                    node_net_hwaddress = \
-                        FLAGS.baremetal_pxe_tftp_node_hwaddress_override
-                else:
-                    node_net_hwaddress = node['prov_mac_address']
-
-                if FLAGS.baremetal_pxe_tftp_node_hwaddress_override:
-                    node_net_name = FLAGS.baremetal_pxe_interface_override_name
-                else:
-                    node_net_name = "eth0"
-
-                # over writting for test env. real values in network info
-                template_values = {'name': node_net_name, 
-                    'address': node_ip, 
-                    'netmask': node_net_netmask, 
-                    'broadcast': node_net_broadcast, 
-                    'gateway': node_net_gateway, 
-                    'dns': node_net_dns, 
-                    'hwaddress': node_net_hwaddress}
-
-                # because template system just not working
-                template_file_text = template_file_text.replace(
-                    '${template_values.name}', node_net_name)
-                template_file_text = template_file_text.replace(
-                    '${template_values.address}', node_ip)
-                template_file_text = template_file_text.replace(
-                    '${template_values.netmask}', node_net_netmask)
-                template_file_text = template_file_text.replace(
-                    '${template_values.broadcast}', node_net_broadcast)
-                template_file_text = template_file_text.replace(
-                    '${template_values.gateway}', node_net_gateway)
-                template_file_text = template_file_text.replace(
-                    '${template_values.dns}', node_net_dns)
-                template_file_text = template_file_text.replace(
-                    '${template_values.hwaddress}', node_net_hwaddress)
             elif 'root_key' in filename:
                 LOG.debug("Setup root key vars")
-                template_values = {'root_key': instance['key_data']}
-                # because template system just not working
-                template_file_text = template_file_text.replace( 
-                    '${template_values.ssh_key}', instance['key_data'])
             else:
                 LOG.debug("Setup static file")
-                template_values = {'dummy_key': 'dummy_value'}
-                        
+
             # not sure what going on here.. this should work
             #_late_load_cheetah()
             #template_filled_in = str(Template(template_file_text, 
             #    searchList={'template_values': template_values}))
+            # because template system just not working
+            template_file_text = template_file_text.replace( 
+                '${template_values.ssh_key}', instance['key_data'])
+            template_file_text = template_file_text.replace(
+                '${template_values.name}', node_net_name)
+            template_file_text = template_file_text.replace(
+                '${template_values.address}', node_ip)
+            template_file_text = template_file_text.replace(
+                '${template_values.netmask}', node_net_netmask)
+            template_file_text = template_file_text.replace(
+                '${template_values.broadcast}', node_net_broadcast)
+            template_file_text = template_file_text.replace(
+                '${template_values.gateway}', node_net_gateway)
+            template_file_text = template_file_text.replace(
+                '${template_values.dns}', node_net_dns)
+            template_file_text = template_file_text.replace(
+                '${template_values.hwaddress}', node_net_hwaddress)
+            template_file_text = template_file_text.replace(
+                '${template_values.root_key_url}', tmp_root_key_url)
+            template_file_text = template_file_text.replace(
+                '${template_values.interface_file_url}', tmp_interface_url)
+            template_file_text = template_file_text.replace(
+                '${template_values.address}', node_ip)
+            template_file_text = template_file_text.replace(
+                '${template_values.netmask}', node_net_netmask)
+            template_file_text = template_file_text.replace(
+                '${template_values.name}', node_hostname)
+            template_file_text = template_file_text.replace(
+                '${template_values.interface}', node_net_name)
+            template_file_text = template_file_text.replace(
+                '${template_values.repo_url}',  tmp_repo_url)
+            template_file_text = template_file_text.replace( 
+                '${template_values.admin_password}', admin_password)
 
             template_filled_in = template_file_text
 
+            LOG.debug(_("Saving file: %s") % web_store_location)
             f = open(web_store_location, 'w+')
             f.write(template_filled_in)
             f.close()
@@ -1022,18 +982,21 @@ class PXE(object):
 
     def del_line_from_dhcp(self, line_to_del_from_file, file_to_del_line_from):
         """
-        delete line from dhcp host file
+        delete line from dhcp file
         """
-        LOG.debug(_("Checking for line (%s) in %s") 
+        LOG.debug(_("deleting line (%s) in %s") 
             % (line_to_del_from_file, file_to_del_line_from))
-        f = open(file_to_del_line_from , 'r+')
-        current_file_lines = f.readlines()
-        f.close()
-        f = open(file_to_del_line_from, 'w+')
-        for line in current_file_lines: 
-            if line_to_del_from_file not in line:
-                f.write(line)
-        f.close()
+        if os.path.exists(file_to_del_line_from):
+            f = open(file_to_del_line_from , 'r+')
+            current_file_lines = f.readlines()
+            f.close()
+            f = open(file_to_del_line_from, 'w+')
+            for line in current_file_lines: 
+                if line_to_del_from_file not in line:
+                    f.write(line)
+                else:
+                    LOG.debug(_("Found Line Removing."))
+            f.close()
 
     def remove_node_dnsmasq(self, node, var, instance):
         """
@@ -1044,16 +1007,102 @@ class PXE(object):
         node_mac_address = node['prov_mac_address']
         dhcp_host_file = FLAGS.baremetal_dnsmasq_dhcp_host_file
         
-        self.del_line_from_dhcp(node_mac_address, dhcp_host_file)
-
         pxe_interface = FLAGS.flat_interface
         dnsmasq_pid_path = _dnsmasq_pid_path(pxe_interface)
         dnsmasq_lease_path = _dnsmasq_lease_path(pxe_interface)
- 
+
+        self.del_line_from_dhcp(node_mac_address, dhcp_host_file)
+        self.del_line_from_dhcp(node_mac_address, dnsmasq_lease_path) 
+        
         _start_tftp_dnsmasq(interface=pxe_interface,
                        tftp_root=host_tftp_root, 
                        host_path=dhcp_host_file, 
                        pid_path=dnsmasq_pid_path, 
                        lease_path=dnsmasq_lease_path)
 
+    def mount_unpac_tftp_image(self, image_file_full_path, 
+        image_mnt_unpac_path, image_format):
+        """
+        mount or untar tftp image
+        """
+        if image_format == "iso":
+            LOG.debug(_("mounting %s to %s") % (image_file_full_path, 
+                image_mnt_unpac_path))
 
+            utils.execute('sudo', 'mount', '-o', 'loop', image_file_full_path, 
+                image_mnt_unpac_path)
+
+        elif image_format == "raw":
+            LOG.debug(_("untaring %s to %s") % (image_file_full_path, 
+                image_mnt_unpac_path))
+                
+            utils.execute('sudo', 'tar', '-xzf', image_file_full_path, '-C', 
+                image_mnt_unpac_path)
+
+    def unmount_tftp_image(self, image_mnt_unpac_path):
+        """
+        Un-mount the tftp iso ... if its mounted
+        """
+        if os.path.exists(image_mnt_unpac_path):
+            if os.path.ismount(image_mnt_unpac_path):
+                LOG.debug(_("unmounting master tftp image (%s)") %
+                    image_mnt_unpac_path)
+                utils.execute('sudo', 'umount', image_mnt_unpac_path)
+    
+    def setup_tftp_boot_kernel_options_file(self, node_tftp_path, node_ip, 
+        node_host_name, image_distro):
+        """
+        Setup what is needed for the tftp boot loader kernel 
+        options.
+        
+        TODO: make FLAGS.baremetal_pxe_tftp_boot_kernel_options_file
+        an option of the tftp image and not a flag
+        
+        make FLAGS.baremetal_pxe_tftp_node_default_interface a
+        option of the node
+        """
+        kernel_options_file = os.path.join(node_tftp_path, 
+        FLAGS.baremetal_pxe_tftp_boot_kernel_options_file)
+
+        LOG.debug(_("configuring kernel options file (%s)") % 
+            kernel_options_file)
+        
+        template_file_text = open(kernel_options_file).read()
+
+        tmp_interface = FLAGS.baremetal_pxe_tftp_node_default_interface
+        tmp_hostname = node_host_name
+        tmp_preseed_filename = _(image_distro + '.preseed.' + node_ip)
+        tmp_preseed_base_url = self.get_node_tftp_conf_base_url(node_ip)
+        tmp_preseed_url = _(tmp_preseed_base_url + tmp_preseed_filename)
+        template_values = {'interface': tmp_interface, 'hostname': tmp_hostname, 
+            'preseed_url': tmp_preseed_url}
+        
+        # not sure what going on here.. this should work
+        #_late_load_cheetah()
+        #template_filled_in = str(Template(template_file_text, 
+        #    searchList={'template_values': template_values}))
+
+        # because template system just not working
+        template_file_text = template_file_text.replace( 
+            '${template_values.interface}', tmp_interface)
+        template_file_text = template_file_text.replace( 
+            '${template_values.hostname}', tmp_hostname)
+        template_file_text = template_file_text.replace( 
+            '${template_values.preseed_url}', tmp_preseed_url)
+        template_filled_in = template_file_text
+
+        # save the kernel options file
+        f = open(kernel_options_file, 'w+')
+        f.write(template_filled_in)
+        f.close()
+
+    def get_node_tftp_conf_base_url(self, node_ip):
+        """
+        return a nodes base url for preseed / kickstart
+        and other config files
+        """
+        tmp_url = _(FLAGS.baremetal_pxe_tftp_base_url + "/pxe_cfg_files/" + 
+            node_ip + '/')
+
+        return tmp_url
+        

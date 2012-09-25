@@ -201,7 +201,7 @@ class BareMetalDriver(driver.ComputeDriver):
         # handle the image a bit differently
         pxe_tftp_build = self.check_if_tftp_boot_image(image_meta)
         if pxe_tftp_build:
-            LOG.debug("Setting up pxe tftp boot for dare metal")
+            LOG.debug("Setting up pxe tftp boot for bare metal")
 
             self.baremetal_nodes.create_pxe_tftp_boot_image_files(var, node, 
                 context, instance, image_meta, admin_password, 
