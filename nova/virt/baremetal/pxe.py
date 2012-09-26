@@ -97,6 +97,9 @@ pxe_opts = [
     cfg.StrOpt('baremetal_tftp_web_store_path',
                 default=None,
                 help='web storage path for tftp files'),
+    cfg.StrOpt('baremetal_conf_file_web_folder',
+                default=None,
+                help='web storage folder added to web folder for cfg files')
            ]
 
 FLAGS = flags.FLAGS
