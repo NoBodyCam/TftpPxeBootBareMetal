@@ -498,6 +498,273 @@ class PXE(object):
 
     def destroy_images(self, var, context, node, instance):
         image_root = var['image_root']
+        shutil.rmtree(image_root, ignore_errors=True)
+
+    def _pxe_cfg_name(self, node):
+        name = "01-" + node['prov_mac_address'].replace(":", "-").lower()
+        return name
+
+    def activate_bootloader(self, var, context, node, instance):
+        tftp_root = var['tftp_root']
+        image_path = var['image_path']
+
+        deploy_aki_id = FLAGS.baremetal_deploy_kernel
+        deploy_ari_id = FLAGS.baremetal_deploy_ramdisk
+        aki_id = str(instance['kernel_id'])
+        ari_id = str(instance['ramdisk_id'])
+
+        images = [(deploy_aki_id, 'deploy_kernel'),
+                  (deploy_ari_id, 'deploy_ramdisk'),
+                  (aki_id, 'kernel'),
+                  (ari_id, 'ramdisk'),
+                  ]
+
+        libvirt_utils.ensure_tree(tftp_root)
+        if FLAGS.baremetal_pxe_vlan_per_host:
+            tftp_paths = [i[1] for i in images]
+        else:
+            tftp_paths = [os.path.join(str(instance['uuid']), i[1])
+                    for i in images]
+            libvirt_utils.ensure_tree(
+                    os.path.join(tftp_root, str(instance['uuid'])))
+
+        LOG.debug("tftp_paths=%s", tftp_paths)
+
+        def _cache_image_b(image_id, target):
+            LOG.debug("fetching id=%s target=%s", image_id, target)
+            _cache_image_x(context=context,
+                           image_id=image_id,
+                           target=target,
+                           user_id=instance['user_id'],
+                           project_id=instance['project_id'])
+
+        for image, path in zip(images, tftp_paths):
+            target = os.path.join(tftp_root, path)
+            _cache_image_b(image[0], target)
+
+        pxe_config_dir = os.path.join(tftp_root, 'pxelinux.cfg')
+        pxe_config_path = os.path.join(pxe_config_dir,
+                                       self._pxe_cfg_name(node))
+
+        root_mb = instance['root_gb'] * 1024
+
+        inst_type_id = instance['instance_type_id']
+        inst_type = instance_types.get_instance_type(inst_type_id)
+        swap_mb = inst_type['swap']
+        if swap_mb < 1024:
+            swap_mb = 1024
+
+        pxe_ip = None
+        if FLAGS.baremetal_pxe_vlan_per_host:
+            pxe_ip_id = bmdb.bm_pxe_ip_associate(context, node['id'])
+            pxe_ip = bmdb.bm_pxe_ip_get(context, pxe_ip_id)
+
+        deployment_key = _random_alnum(32)
+        deployment_id = bmdb.bm_deployment_create(context, deployment_key,
+                                                  image_path, pxe_config_path,
+                                                  root_mb, swap_mb)
+        iscsi_iqn = "iqn-%s" % str(instance['uuid'])
+        iscsi_portal = None
+        if FLAGS.baremetal_pxe_append_iscsi_portal:
+            if pxe_ip:
+                iscsi_portal = pxe_ip['server_address']
+        pxeconf = _build_pxe_config(deployment_id, deployment_key, iscsi_iqn,
+            tftp_paths[0], tftp_paths[1], tftp_paths[2], tftp_paths[3],
+            iscsi_portal)
+
+        libvirt_utils.ensure_tree(pxe_config_dir)
+        libvirt_utils.write_to_file(pxe_config_path, pxeconf)
+
+        if FLAGS.baremetal_pxe_vlan_per_host:
+            vlan_id = node['prov_vlan_id']
+            server_address = pxe_ip['server_address']
+            client_address = pxe_ip['address']
+            _start_per_host_pxe_server(tftp_root, vlan_id,
+                                       server_address, client_address)
+
+    def deactivate_bootloader(self, var, context, node, instance):
+        tftp_root = var['tftp_root']
+
+        if FLAGS.baremetal_pxe_vlan_per_host:
+            _stop_per_host_pxe_server(tftp_root, node['prov_vlan_id'])
+            bmdb.bm_pxe_ip_disassociate(context, node['id'])
+            tftp_image_dir = tftp_root
+        else:
+            tftp_image_dir = os.path.join(tftp_root, str(instance['uuid']))
+        shutil.rmtree(tftp_image_dir, ignore_errors=True)
+
+        pxe_config_path = os.path.join(tftp_root,
+                                       "pxelinux.cfg",
+                                       self._pxe_cfg_name(node))
+        _unlink_without_raise(pxe_config_path)
+
+    def activate_node(self, var, context, node, instance):
+        pass
+
+    def deactivate_node(self, var, context, node, instance):
+        pass
+
+    def get_console_output(self, node, instance):
+        raise NotImplementedError()
+        
+
+class TFTPPXE(object):
+
+    def __init__(self):
+        if not FLAGS.baremetal_deploy_kernel:
+            raise exception.NovaException(
+                    'baremetal_deploy_kernel is not defined')
+        if not FLAGS.baremetal_deploy_ramdisk:
+            raise exception.NovaException(
+                    'baremetal_deploy_ramdisk is not defined')
+
+    def define_vars(self, instance, network_info, block_device_info):
+        var = {}
+        var['image_root'] = os.path.join(FLAGS.instances_path,
+                                         instance['name'])
+        if FLAGS.baremetal_pxe_vlan_per_host:
+            var['tftp_root'] = os.path.join(FLAGS.baremetal_tftp_root,
+                                            str(instance['uuid']))
+        else:
+            var['tftp_root'] = FLAGS.baremetal_tftp_root
+        var['network_info'] = network_info
+        var['block_device_info'] = block_device_info
+        return var
+
+    def _inject_to_image(self, context, target, node, inst, network_info,
+                         injected_files=None, admin_password=None):
+        # For now, we assume that if we're not using a kernel, we're using a
+        # partitioned disk image where the target partition is the first
+        # partition
+        target_partition = None
+        if not inst['kernel_id']:
+            target_partition = "1"
+
+        nics_in_order = []
+        pifs = bmdb.bm_interface_get_all_by_bm_node_id(context, node['id'])
+        for pif in pifs:
+            nics_in_order.append(pif['address'])
+        nics_in_order.append(node['prov_mac_address'])
+
+        # rename nics to be in the order in the DB
+        LOG.debug("injecting persistent net")
+        rules = ""
+        i = 0
+        for hwaddr in nics_in_order:
+            rules += 'SUBSYSTEM=="net", ACTION=="add", DRIVERS=="?*", ' \
+                     'ATTR{address}=="%s", ATTR{dev_id}=="0x0", ' \
+                     'ATTR{type}=="1", KERNEL=="eth*", NAME="eth%d"\n' \
+                     % (hwaddr.lower(), i)
+            i += 1
+        if not injected_files:
+            injected_files = []
+        injected_files.append(('/etc/udev/rules.d/70-persistent-net.rules',
+                               rules))
+        bootif_name = "eth%d" % (i - 1)
+
+        if inst['key_data']:
+            key = str(inst['key_data'])
+        else:
+            key = None
+        net = ""
+        nets = []
+        ifc_template = open(FLAGS.baremetal_injected_network_template).read()
+        ifc_num = -1
+        have_injected_networks = False
+        for (network_ref, mapping) in network_info:
+            ifc_num += 1
+            # always inject
+            #if not network_ref['injected']:
+            #    continue
+            have_injected_networks = True
+            address = mapping['ips'][0]['ip']
+            netmask = mapping['ips'][0]['netmask']
+            address_v6 = None
+            gateway_v6 = None
+            netmask_v6 = None
+            if FLAGS.use_ipv6:
+                address_v6 = mapping['ip6s'][0]['ip']
+                netmask_v6 = mapping['ip6s'][0]['netmask']
+                gateway_v6 = mapping['gateway_v6']
+            name = 'eth%d' % ifc_num
+            if FLAGS.baremetal_use_unsafe_vlan \
+                    and mapping['should_create_vlan'] \
+                    and network_ref.get('vlan'):
+                name = 'eth%d.%d' % (ifc_num, network_ref.get('vlan'))
+            net_info = {'name': name,
+                   'address': address,
+                   'netmask': netmask,
+                   'gateway': mapping['gateway'],
+                   'broadcast': mapping['broadcast'],
+                   'dns': ' '.join(mapping['dns']),
+                   'address_v6': address_v6,
+                   'gateway_v6': gateway_v6,
+                   'netmask_v6': netmask_v6,
+                   'hwaddress': mapping['mac']}
+            nets.append(net_info)
+
+        if have_injected_networks:
+            _late_load_cheetah()
+            net = str(Template(ifc_template,
+                               searchList=[{'interfaces': nets,
+                                            'use_ipv6': FLAGS.use_ipv6}]))
+        net += "\n"
+        net += "auto %s\n" % bootif_name
+        net += "iface %s inet dhcp\n" % bootif_name
+
+        if not FLAGS.baremetal_inject_password:
+            admin_password = None
+
+        metadata = inst.get('metadata')
+        if any((key, net, metadata, admin_password)):
+            inst_name = inst['name']
+
+            img_id = inst['image_ref']
+
+            for injection in ('metadata', 'key', 'net', 'admin_password'):
+                if locals()[injection]:
+                    LOG.info(_('instance %(inst_name)s: injecting '
+                               '%(injection)s into image %(img_id)s'),
+                             locals(), instance=inst)
+            try:
+                disk.inject_data(target,
+                                 key, net, metadata, admin_password,
+                                 files=injected_files,
+                                 partition=target_partition,
+                                 use_cow=False)
+
+            except Exception as e:
+                # This could be a windows image, or a vmdk format disk
+                LOG.warn(_('instance %(inst_name)s: ignoring error injecting'
+                        ' data into image %(img_id)s (%(e)s)') % locals(),
+                         instance=inst)
+
+    def create_image(self, var, context, image_meta, node, instance,
+                     injected_files=None, admin_password=None):
+        image_root = var['image_root']
+        network_info = var['network_info']
+
+        ami_id = str(image_meta['id'])
+        libvirt_utils.ensure_tree(image_root)
+        image_path = os.path.join(image_root, 'disk')
+        LOG.debug("fetching image id=%s target=%s", ami_id, image_path)
+
+        _cache_image_x(context=context,
+                       target=image_path,
+                       image_id=ami_id,
+                       user_id=instance['user_id'],
+                       project_id=instance['project_id'])
+
+        LOG.debug("injecting to image id=%s target=%s", ami_id, image_path)
+        self._inject_to_image(context, image_path, node,
+                              instance, network_info,
+                              injected_files=injected_files,
+                              admin_password=admin_password)
+        var['image_path'] = image_path
+        LOG.debug("fetching images all done")
+
+    def destroy_images(self, var, context, node, instance):
+        image_root = var['image_root']
         mount_check = os.path.join(image_root, 'mnt')
         self.unmount_tftp_image(mount_check)
         shutil.rmtree(image_root, ignore_errors=True)
