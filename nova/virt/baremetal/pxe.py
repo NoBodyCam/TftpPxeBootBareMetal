@@ -1129,6 +1129,15 @@ class TFTPPXE(object):
             web_store_location = os.path.join(node_web_store_path, 
                 file_to_create)
 
+            if 'preseed' in filename:
+                LOG.debug("Setup preseed file")
+            elif 'interface' in filename:
+                LOG.debug("Setup interface vars")
+            elif 'root_key' in filename:
+                LOG.debug("Setup root key vars")
+            else:
+                LOG.debug("Setup static file")
+
             template_file = os.path.join(master_template_path, filename)
 
             template_file_text = open(template_file).read()
@@ -1145,15 +1154,6 @@ class TFTPPXE(object):
                 'root_key': instance['key_data']
                 }
  
-            if 'preseed' in filename:
-                LOG.debug("Setup preseed file")
-            elif 'interface' in filename:
-                LOG.debug("Setup interface vars")
-            elif 'root_key' in filename:
-                LOG.debug("Setup root key vars")
-            else:
-                LOG.debug("Setup static file")
-
             # not sure what going on here.. this should work
             #_late_load_cheetah()
             #template_filled_in = str(Template(template_file_text, 
@@ -1226,7 +1226,7 @@ class TFTPPXE(object):
         """
         Return a line for dnsmasq's dhcp file
         """
-        LOG.debug(_("get_dhcp_conf_line (node_mac_address:%s / ip: %s / name: %s)")
+        LOG.debug(_("get_dhcp line (node_mac_address:%s / ip: %s / name: %s)")
             % (node_mac_address, domain_ip, domain_name))
         return (_("%s,%s,%s") % (node_mac_address, domain_name, domain_ip) )
 
@@ -1371,8 +1371,8 @@ class TFTPPXE(object):
         return a nodes base url for preseed / kickstart
         and other config files
         """
-        tmp_url = _(FLAGS.baremetal_pxe_tftp_base_url + "/pxe_cfg_files/" + 
-            node_ip + '/')
+        tmp_url = _(FLAGS.baremetal_pxe_tftp_base_url + "/" + 
+            FLAGS.baremetal_conf_file_web_folder + "/" + node_ip + '/')
 
         return tmp_url
         
